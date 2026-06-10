@@ -1,0 +1,11 @@
+# 秘密の鍵（これらを絶対にGitHubに上げない）
+.env*.local
+
+# 依存パッケージやビルド生成物
+node_modules
+.next
+out
+build
+
+# その他環境ごとの不要ファイル
+.DS_Store

@@ -1,0 +1,305 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { supabase } from "@/lib/supabase";
+import { findStock } from "@/mock/data";
+import { Plus, Trash2, Edit2, X } from "lucide-react";
+import AuthGuard from "@/components/AuthGuard";
+
+const yen = (n) => "¥" + Number(n).toLocaleString("ja-JP");
+
+export default function JournalPage() {
+  return (
+    <AuthGuard>
+      <JournalContent />
+    </AuthGuard>
+  );
+}
+
+function JournalContent() {
+  const [journals, setJournals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [isOpen, setIsOpen] = useState(false);
+
+  // フォーム用状態
+  const [editingId, setEditingId] = useState(null);
+  const [ticker, setTicker] = useState("");
+  const [quantity, setQuantity] = useState("");
+  const [entryPrice, setEntryPrice] = useState("");
+  const [entryAt, setEntryAt] = useState("");
+  const [entryReason, setEntryReason] = useState("");
+  const [exitPrice, setExitPrice] = useState("");
+  const [exitAt, setExitAt] = useState("");
+  const [exitReason, setExitReason] = useState("");
+
+  // 日記一覧の読み込み
+  async function loadJournals() {
+    setLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("trade_journal")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setJournals(data || []);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadJournals();
+  }, []);
+
+  // 新規・編集のポップアップを開く
+  function openModal(item = null) {
+    if (item) {
+      setEditingId(item.id);
+      setTicker(item.ticker);
+      setQuantity(item.quantity.toString());
+      setEntryPrice(item.entry_price.toString());
+      setEntryAt(item.entry_at ? item.entry_at.substring(0, 16) : "");
+      setEntryReason(item.entry_reason || "");
+      setExitPrice(item.exit_price ? item.exit_price.toString() : "");
+      setExitAt(item.exit_at ? item.exit_at.substring(0, 16) : "");
+      setExitReason(item.exit_reason || "");
+    } else {
+      setEditingId(null);
+      setTicker("");
+      setQuantity("");
+      setEntryPrice("");
+      setEntryAt(new Date().toISOString().substring(0, 16));
+      setEntryReason("");
+      setExitPrice("");
+      setExitAt("");
+      setExitReason("");
+    }
+    setIsOpen(true);
+  }
+
+  // 保存処理
+  async function handleSave(e) {
+    e.preventDefault();
+    const payload = {
+      ticker: ticker.trim(),
+      quantity: Number(quantity),
+      entry_price: Number(entryPrice),
+      entry_at: entryAt ? new Date(entryAt).toISOString() : null,
+      entry_reason: entryReason,
+      exit_price: exitPrice ? Number(exitPrice) : null,
+      exit_at: exitAt ? new Date(exitAt).toISOString() : null,
+      exit_reason: exitReason,
+    };
+
+    try {
+      if (editingId) {
+        await supabase.from("trade_journal").update(payload).eq("id", editingId);
+      } else {
+        await supabase.from("trade_journal").insert([payload]);
+      }
+      setIsOpen(false);
+      loadJournals();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  // 削除処理
+  async function handleDelete(id) {
+    if (!confirm("この売買記録を削除しますか？")) return;
+    try {
+      await supabase.from("trade_journal").delete().eq("id", id);
+      loadJournals();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-50 p-6 md:p-10">
+      <div className="max-w-5xl mx-auto">
+        
+        <div className="flex justify-between items-center border-b border-slate-800 pb-4 mb-6">
+          <div>
+            <p className="text-emerald-400 text-xs font-semibold tracking-widest uppercase mb-1">Journal</p>
+            <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">売買ノート（投資日記）</h1>
+          </div>
+          <button
+            onClick={() => openModal()}
+            className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2.5 text-sm transition-all"
+          >
+            <Plus size={16} />
+            新規記録
+          </button>
+        </div>
+
+        {/* 記録カード一覧 */}
+        {loading ? (
+          <p className="text-center text-slate-500 py-10">読み込み中...</p>
+        ) : journals.length === 0 ? (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center text-slate-400">
+            まだ売買記録がありません。「新規記録」からエントリーの振り返りを書き残しましょう！
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-4">
+            {journals.map((j) => {
+              const stockName = findStock(j.ticker)?.name || j.ticker;
+              const isSettled = j.exit_price != null;
+              
+              const profit = isSettled ? (j.exit_price - j.entry_price) * j.quantity : 0;
+              const profitRate = isSettled ? ((j.exit_price - j.entry_price) / j.entry_price) * 100 : 0;
+
+              return (
+                <div key={j.id} className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col md:flex-row justify-between gap-4">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-3 mb-2">
+                      <span className="font-mono font-bold text-emerald-400 text-sm bg-slate-950 px-2 py-0.5 rounded border border-slate-800">{j.ticker}</span>
+                      <h3 className="font-bold text-base text-slate-100">{stockName}</h3>
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${isSettled ? "bg-slate-800 text-slate-400" : "bg-emerald-500/10 text-emerald-400"}`}>
+                        {isSettled ? "決済済み" : "保有中"}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2 mt-3 text-xs border-t border-slate-800/50 pt-3">
+                      <div>
+                        <span className="text-slate-500 block">株数</span>
+                        <span className="font-mono text-slate-200">{j.quantity.toLocaleString()} 株</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">エントリー価格</span>
+                        <span className="font-mono text-slate-200">{yen(j.entry_price)}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">エグジット価格</span>
+                        <span className="font-mono text-slate-200">{isSettled ? yen(j.exit_price) : "---"}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">損益結果</span>
+                        {isSettled ? (
+                          <span className={`font-mono font-bold ${profit >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                            {profit >= 0 ? "+" : ""}{yen(Math.round(profit))} ({profitRate.toFixed(1)}%)
+                          </span>
+                        ) : (
+                          <span className="text-slate-500">---</span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-4 space-y-2 text-xs">
+                      {j.entry_reason && (
+                        <div className="bg-slate-950/40 p-2.5 rounded-xl border border-slate-800/40">
+                          <span className="text-emerald-400 font-bold block mb-1">📥 エントリー理由 ({j.entry_at ? new Date(j.entry_at).toLocaleDateString() : "未指定"})</span>
+                          <p className="text-slate-300 whitespace-pre-wrap">{j.entry_reason}</p>
+                        </div>
+                      )}
+                      {isSettled && j.exit_reason && (
+                        <div className="bg-slate-950/40 p-2.5 rounded-xl border border-slate-800/40">
+                          <span className="text-amber-400 font-bold block mb-1">📤 エグジット理由 ({j.exit_at ? new Date(j.exit_at).toLocaleDateString() : "未指定"})</span>
+                          <p className="text-slate-300 whitespace-pre-wrap">{j.exit_reason}</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex md:flex-col justify-end gap-2 border-t md:border-t-0 border-slate-800 pt-3 md:pt-0">
+                    <button onClick={() => openModal(j)} className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors" title="編集">
+                      <Edit2 size={14} />
+                    </button>
+                    <button onClick={() => handleDelete(j.id)} className="p-2 rounded-lg bg-slate-800 hover:bg-rose-950 text-rose-400 transition-colors" title="削除">
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* 📥 入力・編集モーダル */}
+        {isOpen && (
+          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+              <div className="flex justify-between items-center px-6 py-4 border-b border-slate-800 bg-slate-850">
+                <h2 className="font-bold text-slate-100">{editingId ? "売買記録を編集" : "新しい売買を記録"}</h2>
+                <button onClick={() => setIsOpen(false)} className="text-slate-400 hover:text-slate-100 transition-colors">
+                  <X size={18} />
+                </button>
+              </div>
+
+              <form onSubmit={handleSave} className="p-6 space-y-4 max-h-[80vh] overflow-y-auto">
+                <div className="grid grid-cols-2 gap-4">
+                  {/* 🚀 ここをリアルタイム表示に対応させました！ */}
+                  <label className="block">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="block text-xs text-slate-400">銘柄コード</span>
+                      {ticker.trim().length >= 4 && findStock(ticker.trim()) && (
+                        <span className="text-xs text-emerald-400 font-bold animate-pulse">➔ {findStock(ticker.trim()).name}</span>
+                      )}
+                    </div>
+                    <input type="text" required className={inputCls} placeholder="例: 8058" value={ticker} onChange={(e) => setTicker(e.target.value)} />
+                  </label>
+                  <label className="block">
+                    <span className="block text-xs text-slate-400 mb-1">株数</span>
+                    <input type="number" required className={inputCls} placeholder="100" value={quantity} onChange={(e) => setQuantity(e.target.value)} />
+                  </label>
+                </div>
+
+                <div className="border-t border-slate-800/60 pt-3">
+                  <h4 className="text-xs font-bold text-emerald-400 mb-2">📥 エントリー（買い）</h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="block text-xs text-slate-400 mb-1">エントリー価格</span>
+                      <input type="number" required className={inputCls} placeholder="4979" value={entryPrice} onChange={(e) => setEntryPrice(e.target.value)} />
+                    </label>
+                    <label className="block">
+                      <span className="block text-xs text-slate-400 mb-1">エントリー日時</span>
+                      <input type="datetime-local" className={inputCls} value={entryAt} onChange={(e) => setEntryAt(e.target.value)} />
+                    </label>
+                  </div>
+                  <label className="block mt-2">
+                    <span className="block text-xs text-slate-400 mb-1">エントリー根拠・メモ</span>
+                    <textarea className={inputCls} rows={2} placeholder="移動平均線が反発したため、根拠を持ってエントリー" value={entryReason} onChange={(e) => setEntryReason(e.target.value)} />
+                  </label>
+                </div>
+
+                <div className="border-t border-slate-800/60 pt-3">
+                  <h4 className="text-xs font-bold text-amber-400 mb-2">📤 エグジット（売り・任意）</h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="block text-xs text-slate-400 mb-1">エグジット価格</span>
+                      <input type="number" className={inputCls} placeholder="5200" value={exitPrice} onChange={(e) => setExitPrice(e.target.value)} />
+                    </label>
+                    <label className="block">
+                      <span className="block text-xs text-slate-400 mb-1">エグジット日時</span>
+                      <input type="datetime-local" className={inputCls} value={exitAt} onChange={(e) => setExitAt(e.target.value)} />
+                    </label>
+                  </div>
+                  <label className="block mt-2">
+                    <span className="block text-xs text-slate-400 mb-1">エグジット根拠・反省メモ</span>
+                    <textarea className={inputCls} rows={2} placeholder="目標ラインに達したため利確。トレードルール通り。" value={exitReason} onChange={(e) => setExitReason(e.target.value)} />
+                  </label>
+                </div>
+
+                <div className="border-t border-slate-800 pt-4 flex justify-end gap-2">
+                  <button type="button" onClick={() => setIsOpen(false)} className="rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold px-4 py-2 text-sm transition-colors">
+                    キャンセル
+                  </button>
+                  <button type="submit" className="rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-5 py-2 text-sm transition-colors">
+                    記録を保存
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+const inputCls =
+  "w-full rounded-xl bg-slate-800 border border-slate-700 focus:border-emerald-500 focus:outline-none px-3 py-2 text-slate-100 text-sm placeholder-slate-600 font-sans";
