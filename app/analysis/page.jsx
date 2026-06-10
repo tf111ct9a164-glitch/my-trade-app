@@ -323,8 +323,8 @@ function AnalysisContent() {
           </div>
 
           {loading ? ( <p className="py-20 text-center text-slate-500">読み込み中...</p> ) : error ? ( <p className="py-20 text-center text-rose-400 text-sm">エラー：{error}</p> ) : bars.length === 0 ? ( <p className="py-20 text-center text-slate-500">データがありません</p> ) : (
-            <CandleChart data={bars} height={420} markers={chartMarkers} showMA={showMA} maShort={maShort} maLong={maLong} />
-          )}
+  <CandleChart data={bars} height={420} markers={chartMarkers} showMA={showMA} maShort={maShort} maLong={maLong} />
+)}
         </section>
       </div>
     </div>
