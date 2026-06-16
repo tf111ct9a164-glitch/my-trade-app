@@ -2,6 +2,9 @@
 
 // =============================================================================
 //  東証全銘柄対応・爆速スクリーニング画面   app/screener/page.jsx
+//  【テクニカル軸版】株価レンジに加えて、当日騰落率・52週レンジ内の位置・出来高で絞り込み。
+//  指標は stock_prices に保存済みのものを使う（/prices の「現在値を自動取得」で取得）。
+//  ※ PER/PBR/配当などの財務指標は次フェーズ（J-Quants 統合）で追加予定。
 // =============================================================================
 
 import { useEffect, useState, useMemo } from "react";
@@ -23,11 +26,17 @@ function ScreenerContent() {
   const [error, setError] = useState("");
   const [progress, setProgress] = useState({ active: 0, total: 0 });
 
-  // 検索・フィルター用の状態（無料API制約のため株価・業種中心）
+  // 検索・フィルター用の状態
   const [search, setSearch] = useState("");
   const [selectedSector, setSelectedSector] = useState("");
   const [minPrice, setMinPrice] = useState("");
   const [maxPrice, setMaxPrice] = useState("");
+  // テクニカル軸
+  const [minVolume, setMinVolume] = useState("");
+  const [minPos, setMinPos] = useState("");   // 52週レンジ内の位置(%) 下限
+  const [maxPos, setMaxPos] = useState("");   // 52週レンジ内の位置(%) 上限
+  const [minChange, setMinChange] = useState(""); // 当日騰落率(%) 下限
+  const [maxChange, setMaxChange] = useState(""); // 当日騰落率(%) 上限
 
   // 監視リスト登録アニメーション・制御用
   const [watchActionMsg, setWatchActionMsg] = useState("");
@@ -52,47 +61,59 @@ function ScreenerContent() {
     loadScreenerData();
   }, []);
 
-  // 2. 動的に全データから「存在する業種」のリストを抽出（プルダウン用）
+  // 2. 業種プルダウン用
   const sectors = useMemo(() => {
     const list = allStocks.map((s) => s.sector).filter(Boolean);
     return [...new Set(list)].sort();
   }, [allStocks]);
 
-  // 3. クライアント側で爆速条件フィルタリング
+  // 3. 52週レンジ内の位置(%) を計算して各銘柄に付与（0%=52週安値, 100%=52週高値）
+  const enriched = useMemo(() => {
+    return allStocks.map((s) => {
+      const pos =
+        s.price != null && s.week52High != null && s.week52Low != null && s.week52High > s.week52Low
+          ? ((s.price - s.week52Low) / (s.week52High - s.week52Low)) * 100
+          : null;
+      return { ...s, positionPct: pos };
+    });
+  }, [allStocks]);
+
+  // 4. クライアント側で爆速条件フィルタリング
   const filteredStocks = useMemo(() => {
-    return allStocks.filter((s) => {
-      // まだ一度も株価バッチが回っていない銘柄は除外
+    return enriched.filter((s) => {
+      // まだ株価が取得できていない銘柄は除外
       if (s.price === null) return false;
 
-      // コードまたは名前での部分一致
       if (search && !s.code.includes(search) && !s.name.includes(search)) return false;
-      // 業種フィルタ
       if (selectedSector && s.sector !== selectedSector) return false;
-      // 最低株価
       if (minPrice && s.price < Number(minPrice)) return false;
-      // 最高株価
       if (maxPrice && s.price > Number(maxPrice)) return false;
+
+      // テクニカル軸：指定された条件は、その指標が未取得（null）の銘柄を除外する
+      if (minVolume && (s.volume == null || s.volume < Number(minVolume))) return false;
+      if (minPos && (s.positionPct == null || s.positionPct < Number(minPos))) return false;
+      if (maxPos && (s.positionPct == null || s.positionPct > Number(maxPos))) return false;
+      if (minChange && (s.changePct == null || s.changePct < Number(minChange))) return false;
+      if (maxChange && (s.changePct == null || s.changePct > Number(maxChange))) return false;
 
       return true;
     });
-  }, [allStocks, search, selectedSector, minPrice, maxPrice]);
+  }, [enriched, search, selectedSector, minPrice, maxPrice, minVolume, minPos, maxPos, minChange, maxChange]);
 
-  // 4. お気に入り（監視追加）ボタンの処理
+  // 5. 監視リスト（= stock_prices）への追加。冪等で安全（trades は触らない）。
   async function addToWatchlist(stock) {
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      // 既存の「trades」テーブル等のお気に入り保存ロジックに合流（ここでは擬似・または既存流用）
-      const { error: err } = await supabase.from("trades").upsert({
-        user_id: session.user.id,
-        code: stock.code,
-        name: stock.name,
-        updated_at: new Date().toISOString()
-      }, { onConflict: "user_id,code" });
+      const { error: err } = await supabase.from("stock_prices").upsert({
+        ticker: stock.code,
+        current_price: stock.price ?? 0,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "ticker" });
 
       if (err) throw err;
-      
+
       setWatchActionMsg(`🟢 ${stock.name} (${stock.code}) を監視リストに追加しました！`);
       setTimeout(() => setWatchActionMsg(""), 3000);
     } catch (e) {
@@ -101,20 +122,25 @@ function ScreenerContent() {
     }
   }
 
-  // 画面が重くなるのを防ぐため、表示件数を最大300件に制限
+  const resetFilters = () => {
+    setSearch(""); setSelectedSector(""); setMinPrice(""); setMaxPrice("");
+    setMinVolume(""); setMinPos(""); setMaxPos(""); setMinChange(""); setMaxChange("");
+  };
+
+  // 表示件数を最大300件に制限
   const displayStocks = useMemo(() => filteredStocks.slice(0, 300), [filteredStocks]);
 
   return (
     <div className="min-h-screen w-full bg-slate-950 text-slate-100 p-6 md:p-10">
       <div className="mx-auto max-w-6xl">
-        
+
         <header className="mb-8 flex flex-col sm:flex-row sm:items-end justify-between gap-4">
           <div>
             <p className="text-emerald-400 text-xs font-semibold tracking-widest uppercase mb-1">Screener</p>
             <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">東証全銘柄スクリーニング</h1>
           </div>
           <div className="bg-slate-900 border border-slate-800 px-4 py-2 rounded-xl text-xs text-slate-400 font-mono">
-            株価取得済み: <span className="text-emerald-400 font-bold">{progress.active}</span> / 全 {progress.total} 銘柄
+            指標取得済み: <span className="text-emerald-400 font-bold">{progress.active}</span> / 全 {progress.total} 銘柄
           </div>
         </header>
 
@@ -125,57 +151,62 @@ function ScreenerContent() {
         )}
 
         {/* 🛠️ フィルターパネル */}
-        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-5 md:p-6 mb-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <label className="block">
-            <span className="block text-xs text-slate-400 mb-1.5">コード または 銘柄名</span>
-            <input 
-              type="text" 
-              value={search} 
-              onChange={(e) => setSearch(e.target.value)} 
-              placeholder="例: 5803" 
-              className={inputCls} 
-            />
-          </label>
+        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-5 md:p-6 mb-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <label className="block">
+              <span className="block text-xs text-slate-400 mb-1.5">コード または 銘柄名</span>
+              <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="例: 5803" className={inputCls} />
+            </label>
 
-          <label className="block">
-            <span className="block text-xs text-slate-400 mb-1.5">業種・セクター</span>
-            <select 
-              value={selectedSector} 
-              onChange={(e) => setSelectedSector(e.target.value)} 
-              className={inputCls}
-            >
-              <option value="">すべての業種</option>
-              {sectors.map((sec) => (
-                <option key={sec} value={sec}>{sec}</option>
-              ))}
-            </select>
-          </label>
+            <label className="block">
+              <span className="block text-xs text-slate-400 mb-1.5">業種・セクター</span>
+              <select value={selectedSector} onChange={(e) => setSelectedSector(e.target.value)} className={inputCls}>
+                <option value="">すべての業種</option>
+                {sectors.map((sec) => (<option key={sec} value={sec}>{sec}</option>))}
+              </select>
+            </label>
 
-          <label className="block sm:col-span-2 lg:col-span-2">
-            <span className="block text-xs text-slate-400 mb-1.5">株価レンジ (円)</span>
-            <div className="flex items-center gap-2">
-              <input 
-                type="number" 
-                value={minPrice} 
-                onChange={(e) => setMinPrice(e.target.value)} 
-                placeholder="下限なし" 
-                className={inputCls} 
-              />
-              <span className="text-slate-600">〜</span>
-              <input 
-                type="number" 
-                value={maxPrice} 
-                onChange={(e) => setMaxPrice(e.target.value)} 
-                placeholder="上限なし" 
-                className={inputCls} 
-              />
-            </div>
-          </label>
+            <label className="block lg:col-span-2">
+              <span className="block text-xs text-slate-400 mb-1.5">株価レンジ (円)</span>
+              <div className="flex items-center gap-2">
+                <input type="number" value={minPrice} onChange={(e) => setMinPrice(e.target.value)} placeholder="下限なし" className={inputCls} />
+                <span className="text-slate-600">〜</span>
+                <input type="number" value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} placeholder="上限なし" className={inputCls} />
+              </div>
+            </label>
+
+            <label className="block">
+              <span className="block text-xs text-slate-400 mb-1.5">出来高 下限 (株)</span>
+              <input type="number" value={minVolume} onChange={(e) => setMinVolume(e.target.value)} placeholder="例: 1000000" className={`${inputCls} font-mono`} />
+            </label>
+
+            <label className="block lg:col-span-2">
+              <span className="block text-xs text-slate-400 mb-1.5">52週レンジ内の位置 (%)<span className="text-slate-600 ml-1">0=安値 / 100=高値</span></span>
+              <div className="flex items-center gap-2">
+                <input type="number" value={minPos} onChange={(e) => setMinPos(e.target.value)} placeholder="下限" className={`${inputCls} font-mono`} />
+                <span className="text-slate-600">〜</span>
+                <input type="number" value={maxPos} onChange={(e) => setMaxPos(e.target.value)} placeholder="上限" className={`${inputCls} font-mono`} />
+              </div>
+            </label>
+
+            <label className="block">
+              <span className="block text-xs text-slate-400 mb-1.5">当日騰落率 (%)</span>
+              <div className="flex items-center gap-2">
+                <input type="number" value={minChange} onChange={(e) => setMinChange(e.target.value)} placeholder="下限" className={`${inputCls} font-mono`} />
+                <span className="text-slate-600">〜</span>
+                <input type="number" value={maxChange} onChange={(e) => setMaxChange(e.target.value)} placeholder="上限" className={`${inputCls} font-mono`} />
+              </div>
+            </label>
+          </div>
+
+          <div className="flex justify-end mt-4">
+            <button onClick={resetFilters} className="text-xs text-slate-400 hover:text-slate-100 transition-colors">条件をクリア</button>
+          </div>
         </section>
 
-        {/* ⚠️ 財務指標に関する注意書き注記 */}
+        {/* ⚠️ 財務指標に関する注記 */}
         <div className="mb-6 p-3 bg-blue-950/30 border border-blue-900/50 rounded-xl text-xs text-slate-400 leading-relaxed">
-          💡 <strong>お知らせ:</strong> 現在、無料のリアルタイム株価API（終値データ）をベースに巡回しているため、PBR・PER・配当利回りでの全件一括フィルタは制限されています。これらの詳細な財務分析機能は、次のフェーズで「J-Quants API（財務データ）」を統合した際に完全有効化されます。
+          💡 <strong>お知らせ:</strong> 株価・出来高・52週高安・騰落率は Yahoo の実データで絞り込めます（<Link href="/prices" className="text-emerald-400 underline">/prices</Link> の「現在値を自動取得」で更新）。PBR・PER・配当利回りなどの財務指標は、次フェーズの J-Quants 統合で追加予定です。
         </div>
 
         {/* 📊 結果テーブル */}
@@ -185,17 +216,20 @@ function ScreenerContent() {
           ) : error ? (
             <p className="py-20 text-center text-rose-400 text-sm">エラー：{error}</p>
           ) : filteredStocks.length === 0 ? (
-            <p className="py-20 text-center text-slate-500">条件に一致する「株価取得済み」の銘柄がありません。裏のバッチ処理をお待ちください。</p>
+            <p className="py-20 text-center text-slate-500">条件に一致する銘柄がありません。/prices で「現在値を自動取得」を実行して指標を取得してください。</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse text-sm">
                 <thead>
                   <tr className="border-b border-slate-800 bg-slate-950/40 text-slate-400 text-xs font-semibold">
-                    <th className="p-4 w-24">コード</th>
+                    <th className="p-4 w-20">コード</th>
                     <th className="p-4">銘柄名</th>
                     <th className="p-4">業種</th>
-                    <th className="p-4 text-right">現在値 (終値)</th>
-                    <th className="p-4 text-center w-48">アクション</th>
+                    <th className="p-4 text-right">現在値</th>
+                    <th className="p-4 text-right">当日</th>
+                    <th className="p-4 text-right">52週位置</th>
+                    <th className="p-4 text-right">出来高</th>
+                    <th className="p-4 text-center w-44">アクション</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/50 font-medium">
@@ -204,25 +238,34 @@ function ScreenerContent() {
                       <td className="p-4 font-mono text-slate-400">{stock.code}</td>
                       <td className="p-4 text-slate-100 font-bold">{stock.name}</td>
                       <td className="p-4 text-slate-400 text-xs">
-                        <span className="bg-slate-800 px-2 py-1 rounded-md border border-slate-700/60">
-                          {stock.sector}
-                        </span>
+                        <span className="bg-slate-800 px-2 py-1 rounded-md border border-slate-700/60">{stock.sector}</span>
                       </td>
                       <td className="p-4 text-right font-mono text-emerald-400 font-bold">
                         ¥{(stock.price ?? 0).toLocaleString()}
                       </td>
+                      <td className="p-4 text-right font-mono">
+                        {stock.changePct == null ? (
+                          <span className="text-slate-600">—</span>
+                        ) : (
+                          <span className={stock.changePct >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                            {stock.changePct >= 0 ? "+" : ""}{stock.changePct.toFixed(2)}%
+                          </span>
+                        )}
+                      </td>
+                      <td className="p-4 text-right font-mono text-slate-300">
+                        {stock.positionPct == null ? <span className="text-slate-600">—</span> : `${stock.positionPct.toFixed(0)}%`}
+                      </td>
+                      <td className="p-4 text-right font-mono text-slate-400 text-xs">
+                        {stock.volume == null ? <span className="text-slate-600">—</span> : stock.volume.toLocaleString()}
+                      </td>
                       <td className="p-4 flex items-center justify-center gap-2">
-                        <Link 
-                          href={`/analysis?code=${stock.code}`}
-                          className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-2.5 py-1.5 text-xs transition-colors"
-                        >
-                          チャート分析
+                        <Link href={`/analysis?code=${stock.code}`}
+                          className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-2.5 py-1.5 text-xs transition-colors">
+                          チャート
                         </Link>
-                        <button
-                          onClick={() => addToWatchlist(stock)}
-                          className="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-semibold px-2.5 py-1.5 text-xs transition-colors"
-                        >
-                          ＋ 監視追加
+                        <button onClick={() => addToWatchlist(stock)}
+                          className="rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-semibold px-2.5 py-1.5 text-xs transition-colors">
+                          ＋ 監視
                         </button>
                       </td>
                     </tr>
@@ -231,7 +274,7 @@ function ScreenerContent() {
               </table>
               {filteredStocks.length > 300 && (
                 <div className="p-4 text-center text-xs text-slate-500 border-t border-slate-800 bg-slate-950/20">
-                  ⚠️ 描画軽量化のため、条件に該当する {filteredStocks.length} 件のうち最初の 300 件を表示しています。より細かく絞り込むには条件を入力してください。
+                  ⚠️ 描画軽量化のため、該当 {filteredStocks.length} 件のうち最初の 300 件を表示しています。条件を絞り込んでください。
                 </div>
               )}
             </div>

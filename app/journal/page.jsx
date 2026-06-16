@@ -1,5 +1,19 @@
 "use client";
 
+// =============================================================================
+//  売買ノート（投資日記）  app/journal/page.jsx  【案B：trades 同期版】
+//
+//  - trade_journal に保存する瞬間、対応する取引を trades にも書き込む。
+//    エントリー → 買い1行 / エグジット（任意）→ 売り1行 を journal_id 付きで登録。
+//  - 編集時は「この journal 由来の trades を消して入れ直す」方式で二重登録を防止。
+//  - 削除時は trades 側の該当行（journal_id 一致）も一緒に削除。
+//  - これにより、ノートに書くだけでダッシュボードの保有銘柄・損益に反映される。
+//
+//  ◆事前に一度だけ Supabase SQL Editor で実行しておくこと:
+//      alter table trades add column if not exists journal_id uuid;
+//      create index if not exists trades_journal_id_idx on trades(journal_id);
+// =============================================================================
+
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { findStock } from "@/mock/data";
@@ -7,6 +21,13 @@ import { Plus, Trash2, Edit2, X } from "lucide-react";
 import AuthGuard from "@/components/AuthGuard";
 
 const yen = (n) => "¥" + Number(n).toLocaleString("ja-JP");
+
+// ISO文字列 → ローカル日付 "YYYY-MM-DD"（/analysis のマーカー吸着と日付をそろえる）
+const toLocalDate = (iso) => {
+  const dt = iso ? new Date(iso) : new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+};
 
 export default function JournalPage() {
   return (
@@ -20,6 +41,8 @@ function JournalContent() {
   const [journals, setJournals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isOpen, setIsOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   // フォーム用状態
   const [editingId, setEditingId] = useState(null);
@@ -45,6 +68,7 @@ function JournalContent() {
       setJournals(data || []);
     } catch (e) {
       console.error(e);
+      setError(e.message || "読み込みに失敗しました");
     } finally {
       setLoading(false);
     }
@@ -56,6 +80,7 @@ function JournalContent() {
 
   // 新規・編集のポップアップを開く
   function openModal(item = null) {
+    setError("");
     if (item) {
       setEditingId(item.id);
       setTicker(item.ticker);
@@ -80,9 +105,54 @@ function JournalContent() {
     setIsOpen(true);
   }
 
-  // 保存処理
+  // 🔗 案B：この journal 由来の取引を trades に同期する（消してから入れ直す＝冪等）
+  async function syncTrades(journalId, p) {
+    // 1) 既存のこの journal 由来 trades をいったん全削除
+    const { error: delErr } = await supabase.from("trades").delete().eq("journal_id", journalId);
+    if (delErr) throw delErr;
+
+    const name = findStock(p.ticker)?.name || null;
+    const rows = [];
+
+    // 2) エントリー → 買い
+    rows.push({
+      journal_id: journalId,
+      code: p.ticker,
+      name,
+      side: "buy",
+      shares: p.quantity,
+      price: p.entry_price,
+      fee: 0,
+      trade_date: toLocalDate(p.entry_at),
+    });
+
+    // 3) エグジット価格があれば → 売り
+    if (p.exit_price != null) {
+      rows.push({
+        journal_id: journalId,
+        code: p.ticker,
+        name,
+        side: "sell",
+        shares: p.quantity,
+        price: p.exit_price,
+        fee: 0,
+        trade_date: toLocalDate(p.exit_at || p.entry_at),
+      });
+    }
+
+    const { error: insErr } = await supabase.from("trades").insert(rows);
+    if (insErr) throw insErr;
+  }
+
+  // 保存処理（trade_journal → trades の順で同期）
   async function handleSave(e) {
     e.preventDefault();
+    setError("");
+
+    if (!ticker.trim()) { setError("銘柄コードを入力してください"); return; }
+    if (!(Number(quantity) > 0)) { setError("株数は1以上で入力してください"); return; }
+    if (!(Number(entryPrice) >= 0)) { setError("エントリー価格を正しく入力してください"); return; }
+
     const payload = {
       ticker: ticker.trim(),
       quantity: Number(quantity),
@@ -94,34 +164,61 @@ function JournalContent() {
       exit_reason: exitReason,
     };
 
+    setSaving(true);
     try {
+      let journalId = editingId;
+
       if (editingId) {
-        await supabase.from("trade_journal").update(payload).eq("id", editingId);
+        const { error } = await supabase.from("trade_journal").update(payload).eq("id", editingId);
+        if (error) throw error;
       } else {
-        await supabase.from("trade_journal").insert([payload]);
+        // insert したうえで採番された id を受け取る
+        const { data, error } = await supabase
+          .from("trade_journal")
+          .insert([payload])
+          .select("id")
+          .single();
+        if (error) throw error;
+        journalId = data.id;
       }
+
+      // 🔗 trades へ同期（ここが案Bの肝）
+      await syncTrades(journalId, payload);
+
+      setSaving(false);
       setIsOpen(false);
       loadJournals();
     } catch (err) {
       console.error(err);
+      setSaving(false);
+      // journal_id 列が無いと trades 同期でここに落ちる
+      setError(
+        (err.message || "保存に失敗しました") +
+        "（trades に journal_id 列が必要です。未実行ならマイグレーションSQLを流してください）"
+      );
     }
   }
 
-  // 削除処理
+  // 削除処理（trades 側の該当行も一緒に消す）
   async function handleDelete(id) {
-    if (!confirm("この売買記録を削除しますか？")) return;
+    if (!confirm("この売買記録を削除しますか？\n（ダッシュボードの保有・取引履歴からも削除されます）")) return;
+    setError("");
     try {
-      await supabase.from("trade_journal").delete().eq("id", id);
+      const { error: te } = await supabase.from("trades").delete().eq("journal_id", id);
+      if (te) throw te;
+      const { error: je } = await supabase.from("trade_journal").delete().eq("id", id);
+      if (je) throw je;
       loadJournals();
     } catch (err) {
       console.error(err);
+      setError(err.message || "削除に失敗しました");
     }
   }
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50 p-6 md:p-10">
       <div className="max-w-5xl mx-auto">
-        
+
         <div className="flex justify-between items-center border-b border-slate-800 pb-4 mb-6">
           <div>
             <p className="text-emerald-400 text-xs font-semibold tracking-widest uppercase mb-1">Journal</p>
@@ -136,6 +233,12 @@ function JournalContent() {
           </button>
         </div>
 
+        <p className="text-xs text-slate-500 mb-4">
+          ※ ここに記録すると、ダッシュボードの保有銘柄・損益にも自動で反映されます（エグジット未入力＝保有中）。
+        </p>
+
+        {error && <p className="text-rose-400 text-sm mb-4 bg-rose-500/10 border border-rose-800 rounded-xl px-4 py-3">{error}</p>}
+
         {/* 記録カード一覧 */}
         {loading ? (
           <p className="text-center text-slate-500 py-10">読み込み中...</p>
@@ -148,7 +251,7 @@ function JournalContent() {
             {journals.map((j) => {
               const stockName = findStock(j.ticker)?.name || j.ticker;
               const isSettled = j.exit_price != null;
-              
+
               const profit = isSettled ? (j.exit_price - j.entry_price) * j.quantity : 0;
               const profitRate = isSettled ? ((j.exit_price - j.entry_price) / j.entry_price) * 100 : 0;
 
@@ -231,7 +334,6 @@ function JournalContent() {
 
               <form onSubmit={handleSave} className="p-6 space-y-4 max-h-[80vh] overflow-y-auto">
                 <div className="grid grid-cols-2 gap-4">
-                  {/* 🚀 ここをリアルタイム表示に対応させました！ */}
                   <label className="block">
                     <div className="flex justify-between items-center mb-1">
                       <span className="block text-xs text-slate-400">銘柄コード</span>
@@ -283,12 +385,14 @@ function JournalContent() {
                   </label>
                 </div>
 
+                {error && <p className="text-rose-400 text-xs">{error}</p>}
+
                 <div className="border-t border-slate-800 pt-4 flex justify-end gap-2">
                   <button type="button" onClick={() => setIsOpen(false)} className="rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold px-4 py-2 text-sm transition-colors">
                     キャンセル
                   </button>
-                  <button type="submit" className="rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-5 py-2 text-sm transition-colors">
-                    記録を保存
+                  <button type="submit" disabled={saving} className="rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold px-5 py-2 text-sm transition-colors">
+                    {saving ? "保存中..." : "記録を保存"}
                   </button>
                 </div>
               </form>

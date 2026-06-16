@@ -1,11 +1,16 @@
 "use client";
 
 // =============================================================================
-//  保有・監視株価   app/prices/page.jsx
-//  - stock_prices(ticker, current_price, updated_at) と trades をマージ表示
-//  - 現在値のインライン編集（upsert: ticker）
-//  - 各行：銘柄名クリックで /analysis?code=XXXX へジャンプ
-//  - 各行：ゴミ箱で削除（stock_prices と trades の両方から該当銘柄を削除）
+//  保有・監視株価   app/prices/page.jsx  【自動取得＋テクニカル指標保存版】
+//  - 「現在値を自動取得」: 全銘柄コードを /api/prices に投げ、現在値に加えて
+//    52週高安・出来高・当日騰落率も取得して stock_prices に一括 upsert。
+//  - 取得した指標はスクリーナー（/screener）の条件フィルタで使われる。
+//
+//  ◆事前に一度だけ Supabase SQL Editor で実行しておくこと:
+//      alter table stock_prices add column if not exists week52_high numeric;
+//      alter table stock_prices add column if not exists week52_low  numeric;
+//      alter table stock_prices add column if not exists volume      bigint;
+//      alter table stock_prices add column if not exists change_pct  numeric;
 // =============================================================================
 
 import { useEffect, useState } from "react";
@@ -13,7 +18,7 @@ import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { findStock } from "@/mock/data";
 import AuthGuard from "@/components/AuthGuard";
-import { Plus, Check, RefreshCw, Trash2, LineChart } from "lucide-react";
+import { Plus, Check, RefreshCw, Trash2, LineChart, Zap } from "lucide-react";
 
 const yen = (n) => (n == null ? "—" : "¥" + Number(n).toLocaleString("ja-JP"));
 const fmtTime = (iso) =>
@@ -38,6 +43,10 @@ function PricesContent() {
 
   const [form, setForm] = useState({ ticker: "", price: "" });
   const [registering, setRegistering] = useState(false);
+
+  // 自動取得用の状態
+  const [autoFetching, setAutoFetching] = useState(false);
+  const [autoMsg, setAutoMsg] = useState("");
 
   async function load() {
     setLoading(true);
@@ -82,6 +91,57 @@ function PricesContent() {
   }
 
   useEffect(() => { load(); }, []);
+
+  // 🚀 全銘柄の現在値＋指標を Yahoo からまとめて取得して stock_prices に保存
+  async function autoFetchAll() {
+    const codes = rows.map((r) => r.code).filter(Boolean);
+    if (codes.length === 0) { setError("対象の銘柄がありません。先に銘柄か取引を登録してください。"); return; }
+
+    setAutoFetching(true);
+    setError("");
+    setAutoMsg("最新の株価・指標を取得中...");
+    try {
+      const res = await fetch(`/api/prices?codes=${encodeURIComponent(codes.join(","))}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "株価の取得に失敗しました");
+
+      const entries = Object.entries(json.prices || {});
+      if (entries.length === 0) throw new Error("株価を取得できませんでした（市場時間外やコード誤りの可能性）");
+
+      const metrics = json.metrics || {};
+      const now = new Date().toISOString();
+      const payload = entries.map(([ticker, current_price]) => {
+        const m = metrics[ticker] || {};
+        return {
+          ticker,
+          current_price: Number(current_price),
+          week52_high: m.week52High ?? null,
+          week52_low: m.week52Low ?? null,
+          volume: m.volume ?? null,
+          change_pct: m.changePct ?? null,
+          updated_at: now,
+        };
+      });
+
+      // stock_prices に一括 upsert（PK は ticker）
+      const { error: upErr } = await supabase
+        .from("stock_prices")
+        .upsert(payload, { onConflict: "ticker" });
+      if (upErr) throw upErr;
+
+      const failCodes = Object.keys(json.errors || {});
+      setAutoMsg(
+        `${entries.length} 銘柄の現在値・指標を更新しました` +
+        (failCodes.length ? `（取得できず: ${failCodes.join(", ")}）` : "")
+      );
+      await load();
+    } catch (e) {
+      setError(String(e.message ?? e));
+      setAutoMsg("");
+    } finally {
+      setAutoFetching(false);
+    }
+  }
 
   const isDirty = (r) => {
     const d = drafts[r.code];
@@ -151,9 +211,20 @@ function PricesContent() {
             <p className="text-emerald-400 text-xs font-semibold tracking-widest uppercase mb-1">Prices</p>
             <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">保有・監視株価</h1>
           </div>
-          <button onClick={load} className="inline-flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-100 transition-colors">
-            <RefreshCw size={15} className={loading ? "animate-spin" : ""} /> 再読み込み
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={autoFetchAll}
+              disabled={autoFetching || loading}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 text-sm font-bold px-3 py-1.5 transition-colors"
+              title="登録中・取引済みの全銘柄の現在値＋52週高安・出来高・騰落率を取得します"
+            >
+              <Zap size={15} className={autoFetching ? "animate-pulse" : ""} />
+              {autoFetching ? "取得中..." : "現在値を自動取得"}
+            </button>
+            <button onClick={load} className="inline-flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-100 transition-colors">
+              <RefreshCw size={15} className={loading ? "animate-spin" : ""} /> 再読み込み
+            </button>
+          </div>
         </header>
 
         {/* 監視銘柄の追加 */}
@@ -175,8 +246,12 @@ function PricesContent() {
               <Plus size={18} /> {registering ? "登録中..." : "登録"}
             </button>
           </div>
+          <p className="text-xs text-slate-500 mt-3">
+            ※ 初期株価は仮の値でOK。登録後に「現在値を自動取得」を押せば最新株価＋指標で上書きされます。
+          </p>
         </section>
 
+        {autoMsg && <p className="text-emerald-400 text-sm mb-4">{autoMsg}</p>}
         {error && <p className="text-rose-400 text-sm mb-4">{error}</p>}
 
         {/* 一覧 */}
