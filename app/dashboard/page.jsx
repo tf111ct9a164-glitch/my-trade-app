@@ -1,9 +1,10 @@
 "use client";
 
 // =============================================================================
-//  ダッシュボード（認証保護つき・資産推移グラフ復活版）  app/dashboard/page.jsx
+//  ダッシュボード（認証保護つき・資産推移グラフ＋株価ライブ更新版） app/dashboard/page.jsx
 //  - AuthGuard で未ログイン時は /login へ
-//  - 表示のたびに当日の総資産を daily_assets に記録（recordDailySnapshot）
+//  - 表示／更新時に、保有銘柄の最新株価を自動取得して stock_prices を更新 → 再計算
+//    （評価額が常に現在値と連動する。株価取得の失敗は致命的ではないので握りつぶす）
 //  - daily_assets の履歴から資産推移の折れ線グラフを描画
 // =============================================================================
 
@@ -57,21 +58,67 @@ function DashboardContent() {
   const [data, setData] = useState(null);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [priceUpdating, setPriceUpdating] = useState(false);
   const [error, setError] = useState("");
+
+  // 保有銘柄の最新株価を取得して stock_prices を更新する
+  async function fetchLivePrices(codes) {
+    const list = [...new Set((codes ?? []).filter(Boolean))];
+    if (list.length === 0) return;
+
+    const res = await fetch(`/api/prices?codes=${encodeURIComponent(list.join(","))}`);
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || "株価の取得に失敗しました");
+
+    const entries = Object.entries(json.prices || {});
+    if (entries.length === 0) return;
+
+    const metrics = json.metrics || {};
+    const now = new Date().toISOString();
+    const payload = entries.map(([ticker, current_price]) => {
+      const m = metrics[ticker] || {};
+      return {
+        ticker,
+        current_price: Number(current_price),
+        week52_high: m.week52High ?? null,
+        week52_low: m.week52Low ?? null,
+        volume: m.volume ?? null,
+        change_pct: m.changePct ?? null,
+        updated_at: now,
+      };
+    });
+
+    const { error } = await supabase.from("stock_prices").upsert(payload, { onConflict: "ticker" });
+    if (error) throw error;
+  }
 
   async function refresh() {
     setLoading(true);
     setError("");
     try {
-      const portfolio = await loadPortfolio();
+      // 1) まず保存済みデータで即表示（速い）
+      let portfolio = await loadPortfolio();
       setData(portfolio);
+      setLoading(false);
 
-      // 当日の総資産を記録 → 最新の推移を取得
+      // 2) 保有銘柄の最新株価を取りに行って stock_prices を更新 → 再計算
+      //    （Yahoo が落ちても画面は壊さない：失敗はログのみ）
+      try {
+        setPriceUpdating(true);
+        await fetchLivePrices(portfolio.holdings.map((h) => h.code));
+        portfolio = await loadPortfolio();
+        setData(portfolio);
+      } catch (e) {
+        console.error("price refresh failed:", e);
+      } finally {
+        setPriceUpdating(false);
+      }
+
+      // 3) 当日の総資産を記録 → 最新の推移を取得
       await recordDailySnapshot(portfolio.totals);
       setHistory(await loadAssetHistory());
     } catch (e) {
       setError(e.message ?? "データの取得に失敗しました");
-    } finally {
       setLoading(false);
     }
   }
@@ -113,10 +160,11 @@ function DashboardContent() {
           <div className="flex items-center gap-4">
             <button
               onClick={refresh}
-              className="inline-flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-100 transition-colors"
+              disabled={loading || priceUpdating}
+              className="inline-flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-100 disabled:opacity-50 transition-colors"
             >
-              <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
-              更新
+              <RefreshCw size={15} className={loading || priceUpdating ? "animate-spin" : ""} />
+              {priceUpdating ? "株価更新中…" : "更新"}
             </button>
             <button
               onClick={handleLogout}
@@ -144,7 +192,7 @@ function DashboardContent() {
             {t.missingPriceCount > 0 && (
               <div className="flex items-center gap-2 rounded-xl bg-amber-500 bg-opacity-10 border border-amber-800 text-amber-300 text-sm px-4 py-3 mb-6">
                 <AlertTriangle size={16} />
-                <span>{t.missingPriceCount} 銘柄の株価が未登録のため合計に含まれていません。</span>
+                <span>{t.missingPriceCount} 銘柄の株価が取得できず合計に含まれていません。</span>
                 <Link href="/prices" className="underline font-semibold hover:text-amber-200">
                   株価を更新する
                 </Link>

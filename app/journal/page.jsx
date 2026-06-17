@@ -1,13 +1,12 @@
 "use client";
 
 // =============================================================================
-//  売買ノート（投資日記）  app/journal/page.jsx  【案B：trades 同期版】
+//  売買ノート（投資日記）  app/journal/page.jsx  【案B：trades 同期版＋過去ぶん再同期】
 //
-//  - trade_journal に保存する瞬間、対応する取引を trades にも書き込む。
-//    エントリー → 買い1行 / エグジット（任意）→ 売り1行 を journal_id 付きで登録。
-//  - 編集時は「この journal 由来の trades を消して入れ直す」方式で二重登録を防止。
+//  - 保存／編集時に、対応する取引を trades へ journal_id 付きで同期（新規入力ぶん）。
+//  - 「保有に再同期」ボタン：trade_journal の全件を trades に一括同期（過去ぶんの取り込み）。
+//    ※ デプロイ前に入力した過去ノートは trades に無いため、一度押して取り込む。
 //  - 削除時は trades 側の該当行（journal_id 一致）も一緒に削除。
-//  - これにより、ノートに書くだけでダッシュボードの保有銘柄・損益に反映される。
 //
 //  ◆事前に一度だけ Supabase SQL Editor で実行しておくこと:
 //      alter table trades add column if not exists journal_id uuid;
@@ -17,7 +16,7 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { findStock } from "@/mock/data";
-import { Plus, Trash2, Edit2, X } from "lucide-react";
+import { Plus, Trash2, Edit2, X, RefreshCw } from "lucide-react";
 import AuthGuard from "@/components/AuthGuard";
 
 const yen = (n) => "¥" + Number(n).toLocaleString("ja-JP");
@@ -42,7 +41,9 @@ function JournalContent() {
   const [loading, setLoading] = useState(true);
   const [isOpen, setIsOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resyncing, setResyncing] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   // フォーム用状態
   const [editingId, setEditingId] = useState(null);
@@ -107,14 +108,13 @@ function JournalContent() {
 
   // 🔗 案B：この journal 由来の取引を trades に同期する（消してから入れ直す＝冪等）
   async function syncTrades(journalId, p) {
-    // 1) 既存のこの journal 由来 trades をいったん全削除
     const { error: delErr } = await supabase.from("trades").delete().eq("journal_id", journalId);
     if (delErr) throw delErr;
 
     const name = findStock(p.ticker)?.name || null;
     const rows = [];
 
-    // 2) エントリー → 買い
+    // エントリー → 買い
     rows.push({
       journal_id: journalId,
       code: p.ticker,
@@ -126,7 +126,7 @@ function JournalContent() {
       trade_date: toLocalDate(p.entry_at),
     });
 
-    // 3) エグジット価格があれば → 売り
+    // エグジット価格があれば → 売り
     if (p.exit_price != null) {
       rows.push({
         journal_id: journalId,
@@ -142,6 +142,39 @@ function JournalContent() {
 
     const { error: insErr } = await supabase.from("trades").insert(rows);
     if (insErr) throw insErr;
+  }
+
+  // 🔁 過去ぶんを含む全ノートを trades に一括再同期（取り込み）
+  async function resyncAll() {
+    setResyncing(true);
+    setError("");
+    setNotice("");
+    try {
+      const { data, error } = await supabase.from("trade_journal").select("*");
+      if (error) throw error;
+
+      let n = 0;
+      for (const j of data ?? []) {
+        await syncTrades(j.id, {
+          ticker: j.ticker,
+          quantity: j.quantity,
+          entry_price: j.entry_price,
+          entry_at: j.entry_at,
+          exit_price: j.exit_price,
+          exit_at: j.exit_at,
+        });
+        n++;
+      }
+      setNotice(`${n} 件のノートを保有(trades)に再同期しました。ダッシュボードに反映されます。`);
+    } catch (e) {
+      console.error(e);
+      setError(
+        (e.message || "再同期に失敗しました") +
+        "（trades に journal_id 列が必要です。未実行ならマイグレーションSQLを流してください）"
+      );
+    } finally {
+      setResyncing(false);
+    }
   }
 
   // 保存処理（trade_journal → trades の順で同期）
@@ -172,7 +205,6 @@ function JournalContent() {
         const { error } = await supabase.from("trade_journal").update(payload).eq("id", editingId);
         if (error) throw error;
       } else {
-        // insert したうえで採番された id を受け取る
         const { data, error } = await supabase
           .from("trade_journal")
           .insert([payload])
@@ -182,7 +214,6 @@ function JournalContent() {
         journalId = data.id;
       }
 
-      // 🔗 trades へ同期（ここが案Bの肝）
       await syncTrades(journalId, payload);
 
       setSaving(false);
@@ -191,7 +222,6 @@ function JournalContent() {
     } catch (err) {
       console.error(err);
       setSaving(false);
-      // journal_id 列が無いと trades 同期でここに落ちる
       setError(
         (err.message || "保存に失敗しました") +
         "（trades に journal_id 列が必要です。未実行ならマイグレーションSQLを流してください）"
@@ -224,19 +254,31 @@ function JournalContent() {
             <p className="text-emerald-400 text-xs font-semibold tracking-widest uppercase mb-1">Journal</p>
             <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">売買ノート（投資日記）</h1>
           </div>
-          <button
-            onClick={() => openModal()}
-            className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2.5 text-sm transition-all"
-          >
-            <Plus size={16} />
-            新規記録
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={resyncAll}
+              disabled={resyncing}
+              title="過去ぶんを含む全ノートを保有(trades)に取り込みます"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-semibold px-3 py-2.5 text-sm transition-all"
+            >
+              <RefreshCw size={15} className={resyncing ? "animate-spin" : ""} />
+              {resyncing ? "再同期中…" : "保有に再同期"}
+            </button>
+            <button
+              onClick={() => openModal()}
+              className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2.5 text-sm transition-all"
+            >
+              <Plus size={16} />
+              新規記録
+            </button>
+          </div>
         </div>
 
         <p className="text-xs text-slate-500 mb-4">
-          ※ ここに記録すると、ダッシュボードの保有銘柄・損益にも自動で反映されます（エグジット未入力＝保有中）。
+          ※ ここに記録すると、ダッシュボードの保有銘柄・損益にも自動で反映されます（エグジット未入力＝保有中）。過去に入力したノートが保有に出ていない場合は「保有に再同期」を一度押してください。
         </p>
 
+        {notice && <p className="text-emerald-400 text-sm mb-4 bg-emerald-500/10 border border-emerald-800 rounded-xl px-4 py-3">{notice}</p>}
         {error && <p className="text-rose-400 text-sm mb-4 bg-rose-500/10 border border-rose-800 rounded-xl px-4 py-3">{error}</p>}
 
         {/* 記録カード一覧 */}
