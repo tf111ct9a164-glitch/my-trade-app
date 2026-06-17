@@ -111,7 +111,7 @@ function JournalContent() {
     const { error: delErr } = await supabase.from("trades").delete().eq("journal_id", journalId);
     if (delErr) throw delErr;
 
-    const name = findStock(p.ticker)?.name || null;
+    const name = findStock(p.ticker)?.name || p.ticker;
     const rows = [];
 
     // エントリー → 買い
